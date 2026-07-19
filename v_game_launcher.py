@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QScrollArea,
     QStatusBar,
     QTableWidget,
@@ -52,8 +54,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-APP_NAME = "Game Launcher"
-APP_VERSION = "2.0"
+APP_NAME = "V Game Launcher"
+APP_VERSION = "2.0.0"
+
+GITHUB_REPOSITORY_URL = "https://github.com/vladimirrankovicqa/V-Game-Launcher"
+GITHUB_RELEASES_URL = f"{GITHUB_REPOSITORY_URL}/releases"
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/vladimirrankovicqa/V-Game-Launcher/releases/latest"
+GITHUB_API_VERSION = "2026-03-10"
+PREFERRED_UPDATE_ASSET_NAMES = ("V.Game.Launcher.exe", "V Game Launcher.exe")
+UPDATE_CHECK_TIMEOUT = 10
+UPDATE_DOWNLOAD_TIMEOUT = 45
+MAX_UPDATE_DOWNLOAD_BYTES = 500 * 1024 * 1024
 CARD_WIDTH = 220
 CARD_HEIGHT = 355
 COVER_WIDTH = 198
@@ -97,6 +108,155 @@ COVERS_DIR = DATA_DIR / "assets" / "covers"
 LEGACY_DATA_FILE = APP_DIR / "games.json"
 LEGACY_SETTINGS_FILE = APP_DIR / "launcher_settings.json"
 LEGACY_COVERS_DIR = APP_DIR / "assets" / "covers"
+UPDATE_DIR = DATA_DIR / "updates"
+
+
+def parsed_version(value: str) -> tuple[int, int, int] | None:
+    # Parse tags such as v2.1, 2.1.0 or release-2.1.0 into a comparable tuple.
+    match = re.search(r"(?<!\d)(\d+)(?:\.(\d+))?(?:\.(\d+))?", value.strip())
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def is_newer_version(candidate: str, current: str = APP_VERSION) -> bool:
+    candidate_version = parsed_version(candidate)
+    current_version = parsed_version(current)
+    return bool(candidate_version and current_version and candidate_version > current_version)
+
+
+def github_request(url: str) -> Request:
+    return Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"VGameLauncher/{APP_VERSION} (Windows; updater)",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+    )
+
+
+def update_download_request(url: str) -> Request:
+    return Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": f"VGameLauncher/{APP_VERSION} (Windows; updater)",
+        },
+    )
+
+
+def select_release_asset(assets: Any) -> dict[str, Any] | None:
+    if not isinstance(assets, list):
+        return None
+    executable_assets = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict)
+        and str(asset.get("state", "uploaded")).casefold() == "uploaded"
+        and str(asset.get("name", "")).casefold().endswith(".exe")
+        and str(asset.get("browser_download_url", "")).startswith("https://")
+    ]
+    if not executable_assets:
+        return None
+
+    preferred = {name.casefold(): index for index, name in enumerate(PREFERRED_UPDATE_ASSET_NAMES)}
+    exact_matches = [asset for asset in executable_assets if str(asset.get("name", "")).casefold() in preferred]
+    if exact_matches:
+        exact_matches.sort(key=lambda asset: preferred[str(asset.get("name", "")).casefold()])
+        return exact_matches[0]
+
+    portable_matches = [
+        asset
+        for asset in executable_assets
+        if "launcher" in str(asset.get("name", "")).casefold()
+        and not any(token in str(asset.get("name", "")).casefold() for token in ("setup", "installer", "uninstall"))
+    ]
+    if len(portable_matches) == 1:
+        return portable_matches[0]
+    if len(executable_assets) == 1:
+        return executable_assets[0]
+    return None
+
+
+def latest_release_information() -> dict[str, Any]:
+    request = github_request(GITHUB_LATEST_RELEASE_API)
+    try:
+        with urlopen(request, timeout=UPDATE_CHECK_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8-sig"))
+    except HTTPError as error:
+        if error.code == 404:
+            raise RuntimeError("No published GitHub release was found yet.") from error
+        if error.code == 403:
+            raise RuntimeError("GitHub temporarily refused the update check, possibly because of an API rate limit.") from error
+        raise RuntimeError(f"GitHub returned HTTP {error.code} while checking for updates.") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise RuntimeError("The update server could not be reached. Check the internet connection and try again.") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("GitHub returned an invalid update response.") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned an unexpected update response.")
+
+    latest_version = str(payload.get("tag_name", "")).strip()
+    if parsed_version(latest_version) is None:
+        raise RuntimeError("The latest GitHub release does not have a valid version tag.")
+
+    asset = select_release_asset(payload.get("assets", []))
+    return {
+        "latest_version": latest_version,
+        "release_name": str(payload.get("name", latest_version)).strip() or latest_version,
+        "release_url": str(payload.get("html_url", GITHUB_RELEASES_URL)).strip() or GITHUB_RELEASES_URL,
+        "release_notes": str(payload.get("body", "")).strip(),
+        "published_at": str(payload.get("published_at", "")).strip(),
+        "asset": asset,
+    }
+
+
+def updater_safe_batch_value(value: str) -> str:
+    return value.replace("%", "%%")
+
+
+def create_windows_update_script(downloaded_executable: Path, target_executable: Path) -> Path:
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    script_path = UPDATE_DIR / f"apply_update_{uuid.uuid4().hex}.cmd"
+    backup_path = target_executable.with_suffix(target_executable.suffix + ".old")
+    target = updater_safe_batch_value(str(target_executable))
+    source = updater_safe_batch_value(str(downloaded_executable))
+    backup = updater_safe_batch_value(str(backup_path))
+    pid = os.getpid()
+    script = f'''@echo off
+setlocal
+set "TARGET={target}"
+set "SOURCE={source}"
+set "BACKUP={backup}"
+
+:wait_for_launcher
+tasklist /FI "PID eq {pid}" /NH 2>NUL | findstr /R /C:"[ ]{pid}[ ]" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto wait_for_launcher
+)
+
+if exist "%BACKUP%" del /F /Q "%BACKUP%" >NUL 2>&1
+if exist "%TARGET%" move /Y "%TARGET%" "%BACKUP%" >NUL
+move /Y "%SOURCE%" "%TARGET%" >NUL
+if errorlevel 1 goto restore_old_version
+
+if exist "%BACKUP%" del /F /Q "%BACKUP%" >NUL 2>&1
+start "" "%TARGET%"
+goto cleanup
+
+:restore_old_version
+if exist "%BACKUP%" move /Y "%BACKUP%" "%TARGET%" >NUL
+if exist "%TARGET%" start "" "%TARGET%"
+
+:cleanup
+endlocal
+(goto) 2>NUL & del /F /Q "%~f0"
+'''
+    script_path.write_text(script, encoding="utf-8", newline="\r\n")
+    return script_path
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -1156,6 +1316,96 @@ def cover_pixmap(path_value: str, name: str) -> QPixmap:
     return placeholder_cover(name)
 
 
+class UpdateCheckWorker(QThread):
+    result_ready = Signal(object)
+
+    def run(self) -> None:
+        try:
+            information = latest_release_information()
+            latest_version = str(information.get("latest_version", ""))
+            information["status"] = "available" if is_newer_version(latest_version) else "up_to_date"
+            self.result_ready.emit(information)
+        except RuntimeError as error:
+            self.result_ready.emit({"status": "error", "message": str(error)})
+        except Exception as error:
+            self.result_ready.emit({"status": "error", "message": f"Unexpected update error: {error}"})
+
+
+class UpdateDownloadWorker(QThread):
+    progress_changed = Signal(int, int)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, asset: dict[str, Any], version: str) -> None:
+        super().__init__()
+        self.asset = dict(asset)
+        self.version = version
+
+    def run(self) -> None:
+        source_url = str(self.asset.get("browser_download_url", "")).strip()
+        if not source_url.startswith("https://"):
+            self.failed.emit("The release does not contain a valid HTTPS download URL.")
+            return
+
+        expected_size = int(self.asset.get("size", 0) or 0)
+        if expected_size > MAX_UPDATE_DOWNLOAD_BYTES:
+            self.failed.emit("The update file is larger than the allowed download limit.")
+            return
+
+        safe_version = re.sub(r"[^0-9A-Za-z._-]+", "_", self.version.strip()) or "latest"
+        destination = UPDATE_DIR / f"V.Game.Launcher-{safe_version}.exe"
+        partial = destination.with_suffix(destination.suffix + ".part")
+        digest_value = str(self.asset.get("digest", "")).strip().casefold()
+        expected_sha256 = digest_value.removeprefix("sha256:") if digest_value.startswith("sha256:") else ""
+        hasher = hashlib.sha256()
+
+        try:
+            UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+            partial.unlink(missing_ok=True)
+            request = update_download_request(source_url)
+            with urlopen(request, timeout=UPDATE_DOWNLOAD_TIMEOUT) as response, partial.open("wb") as file:
+                header_size = int(response.headers.get("Content-Length", "0") or 0)
+                total_size = expected_size or header_size
+                downloaded = 0
+                while True:
+                    if self.isInterruptionRequested():
+                        raise InterruptedError
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > MAX_UPDATE_DOWNLOAD_BYTES:
+                        raise RuntimeError("The update exceeded the allowed download limit.")
+                    file.write(chunk)
+                    hasher.update(chunk)
+                    self.progress_changed.emit(downloaded, total_size)
+
+            actual_size = partial.stat().st_size
+            if expected_size and actual_size != expected_size:
+                raise RuntimeError("The downloaded update size does not match the GitHub release asset.")
+            if expected_sha256 and hasher.hexdigest().casefold() != expected_sha256:
+                raise RuntimeError("The downloaded update failed the SHA-256 integrity check.")
+            if actual_size == 0:
+                raise RuntimeError("The downloaded update file is empty.")
+            with partial.open("rb") as downloaded_file:
+                if downloaded_file.read(2) != b"MZ":
+                    raise RuntimeError("The downloaded file is not a valid Windows executable.")
+
+            destination.unlink(missing_ok=True)
+            partial.replace(destination)
+            self.completed.emit(str(destination))
+        except InterruptedError:
+            partial.unlink(missing_ok=True)
+            self.cancelled.emit()
+        except HTTPError as error:
+            partial.unlink(missing_ok=True)
+            self.failed.emit(f"GitHub returned HTTP {error.code} while downloading the update.")
+        except (URLError, TimeoutError, OSError, RuntimeError, ValueError) as error:
+            partial.unlink(missing_ok=True)
+            self.failed.emit(str(error))
+
+
 class CoverDownloadWorker(QThread):
     progress_changed = Signal(str)
     cover_downloaded = Signal(str, str)
@@ -1548,8 +1798,11 @@ class SettingsDialog(QDialog):
         self.start_maximized.setChecked(bool(settings.get("start_maximized", False)))
         self.remember_window = QCheckBox("Remember window size and position")
         self.remember_window.setChecked(bool(settings.get("remember_window", True)))
+        self.automatic_updates = QCheckBox("Automatically check for updates")
+        self.automatic_updates.setChecked(bool(settings.get("automatic_updates", True)))
         general.addWidget(self.start_maximized)
         general.addWidget(self.remember_window)
+        general.addWidget(self.automatic_updates)
         general.addSpacing(18)
         storage = QLabel(f"Library data folder:\n{DATA_DIR}")
         storage.setObjectName("settingsPanel")
@@ -1662,6 +1915,7 @@ class SettingsDialog(QDialog):
         self.settings["steam_executable"] = steam_path
         self.settings["start_maximized"] = self.start_maximized.isChecked()
         self.settings["remember_window"] = self.remember_window.isChecked()
+        self.settings["automatic_updates"] = self.automatic_updates.isChecked()
         self.settings["theme"] = str(self.theme_combo.currentData() or "dark")
         self.settings_saved.emit(self.settings)
         self.accept()
@@ -1873,6 +2127,9 @@ class LauncherWindow(QMainWindow):
         self.grid_columns = 0
         self.launch_workers: list[SteamLaunchWorker] = []
         self.cover_worker: CoverDownloadWorker | None = None
+        self.update_check_worker: UpdateCheckWorker | None = None
+        self.update_download_worker: UpdateDownloadWorker | None = None
+        self.update_progress_dialog: QProgressDialog | None = None
         self.running_game_ids: set[str] = set()
         self.launching_game_ids: set[str] = set()
         self.launch_deadlines: dict[str, float] = {}
@@ -1891,6 +2148,8 @@ class LauncherWindow(QMainWindow):
         self.refresh_all()
         self.process_timer.start()
         QTimer.singleShot(700, self.download_missing_covers)
+        if getattr(sys, "frozen", False) and bool(self.settings.get("automatic_updates", True)):
+            QTimer.singleShot(2500, lambda: self.check_for_updates(interactive=False))
         if self.migrated_legacy_data:
             self.statusBar().showMessage("Existing v2.0 library migrated to AppData", 7000)
 
@@ -1914,6 +2173,7 @@ class LauncherWindow(QMainWindow):
             settings["steam_executable"] = detect_steam_executable()
         settings.setdefault("theme", "dark")
         settings.setdefault("sort_order", "name_asc")
+        settings.setdefault("automatic_updates", True)
         return settings
 
     def load_games(self) -> None:
@@ -2571,6 +2831,197 @@ class LauncherWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Nothing imported", "The selected games are already present in the library.")
 
+    def check_for_updates(self, interactive: bool = True) -> None:
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            if interactive:
+                QMessageBox.information(self, "Update check", "An update check is already in progress.")
+            return
+
+        self.statusBar().showMessage("Checking GitHub for updates…")
+        worker = UpdateCheckWorker(self)
+        self.update_check_worker = worker
+        worker.result_ready.connect(lambda result, manual=interactive: self.handle_update_check_result(result, manual))
+        worker.finished.connect(lambda: self.cleanup_update_check_worker(worker))
+        worker.start()
+
+    def cleanup_update_check_worker(self, worker: UpdateCheckWorker) -> None:
+        if self.update_check_worker is worker:
+            self.update_check_worker = None
+        worker.deleteLater()
+
+    def handle_update_check_result(self, result: dict[str, Any], interactive: bool) -> None:
+        status = str(result.get("status", "error"))
+        if status == "error":
+            message = str(result.get("message", "The update check failed."))
+            self.statusBar().showMessage(message, 8000)
+            if interactive:
+                QMessageBox.warning(self, "Update check failed", message)
+            return
+
+        latest_version = str(result.get("latest_version", "")).strip()
+        if status == "up_to_date":
+            self.statusBar().showMessage(f"V Game Launcher {APP_VERSION} is up to date.", 6000)
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "No updates available",
+                    f"You are using the latest version of V Game Launcher ({APP_VERSION}).",
+                )
+            return
+
+        self.statusBar().showMessage(f"V Game Launcher {latest_version} is available.", 10000)
+        self.prompt_for_update(result)
+
+    def prompt_for_update(self, information: dict[str, Any]) -> None:
+        latest_version = str(information.get("latest_version", "")).strip()
+        asset = information.get("asset")
+        release_url = str(information.get("release_url", GITHUB_RELEASES_URL)).strip() or GITHUB_RELEASES_URL
+        notes = str(information.get("release_notes", "")).strip()
+
+        message = QMessageBox(self)
+        message.setWindowTitle("Update available")
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText(f"V Game Launcher {latest_version} is available.")
+        if isinstance(asset, dict) and getattr(sys, "frozen", False):
+            message.setInformativeText(
+                f"Installed version: {APP_VERSION}\n\n"
+                "Download and install the update now? The launcher will restart automatically."
+            )
+            install_button = message.addButton("Download and Install", QMessageBox.ButtonRole.AcceptRole)
+            later_button = message.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+            message.setDefaultButton(install_button)
+            if notes:
+                message.setDetailedText(notes[:12000])
+            message.exec()
+            if message.clickedButton() == install_button:
+                self.start_update_download(information)
+            elif message.clickedButton() == later_button:
+                self.statusBar().showMessage("Update postponed.", 4000)
+            return
+
+        if not isinstance(asset, dict):
+            message.setInformativeText(
+                "The release exists, but it does not contain a compatible portable .exe asset. "
+                "Open the release page to download it manually."
+            )
+        else:
+            message.setInformativeText(
+                "Automatic installation is available in the packaged Windows .exe version. "
+                "Open the release page to download it manually."
+            )
+        open_button = message.addButton("Open Release Page", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+        if notes:
+            message.setDetailedText(notes[:12000])
+        message.exec()
+        if message.clickedButton() == open_button:
+            try:
+                os.startfile(release_url)
+            except OSError:
+                pass
+
+    def start_update_download(self, information: dict[str, Any]) -> None:
+        asset = information.get("asset")
+        if not isinstance(asset, dict):
+            QMessageBox.warning(self, "Update unavailable", "No compatible Windows .exe asset was found in the release.")
+            return
+        if self.update_download_worker is not None and self.update_download_worker.isRunning():
+            QMessageBox.information(self, "Update download", "An update is already being downloaded.")
+            return
+
+        target_executable = Path(sys.executable).resolve()
+        try:
+            target_executable.parent.mkdir(parents=True, exist_ok=True)
+            permission_test = target_executable.parent / f".vgame_update_test_{uuid.uuid4().hex}"
+            permission_test.write_text("test", encoding="utf-8")
+            permission_test.unlink(missing_ok=True)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "Update permission required",
+                f"The launcher cannot update files in this folder:\n{target_executable.parent}\n\n{error}",
+            )
+            return
+
+        latest_version = str(information.get("latest_version", "latest"))
+        progress = QProgressDialog("Preparing update download…", "Cancel", 0, 100, self)
+        progress.setWindowTitle(f"Downloading {latest_version}")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self.update_progress_dialog = progress
+
+        worker = UpdateDownloadWorker(asset, latest_version)
+        self.update_download_worker = worker
+        worker.progress_changed.connect(self.update_download_progress)
+        worker.completed.connect(self.update_download_completed)
+        worker.failed.connect(self.update_download_failed)
+        worker.cancelled.connect(self.update_download_cancelled)
+        worker.finished.connect(lambda: self.cleanup_update_download_worker(worker))
+        progress.canceled.connect(worker.requestInterruption)
+        worker.start()
+        progress.show()
+
+    def update_download_progress(self, downloaded: int, total: int) -> None:
+        if self.update_progress_dialog is None:
+            return
+        if total > 0:
+            percent = max(0, min(100, int(downloaded * 100 / total)))
+            self.update_progress_dialog.setRange(0, 100)
+            self.update_progress_dialog.setValue(percent)
+            self.update_progress_dialog.setLabelText(
+                f"Downloading update… {downloaded / (1024 * 1024):.1f} MB / {total / (1024 * 1024):.1f} MB"
+            )
+        else:
+            self.update_progress_dialog.setRange(0, 0)
+            self.update_progress_dialog.setLabelText(f"Downloading update… {downloaded / (1024 * 1024):.1f} MB")
+
+    def update_download_completed(self, downloaded_path: str) -> None:
+        if self.update_progress_dialog is not None:
+            self.update_progress_dialog.setValue(100)
+            self.update_progress_dialog.close()
+            self.update_progress_dialog.deleteLater()
+            self.update_progress_dialog = None
+
+        downloaded = Path(downloaded_path)
+        target = Path(sys.executable).resolve()
+        try:
+            script = create_windows_update_script(downloaded, target)
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", str(script)],
+                cwd=str(script.parent),
+                close_fds=True,
+                creationflags=creation_flags,
+            )
+        except OSError as error:
+            QMessageBox.critical(self, "Update installation failed", f"The updater could not be started:\n{error}")
+            return
+
+        self.statusBar().showMessage("Update downloaded. Restarting V Game Launcher…")
+        QApplication.quit()
+
+    def update_download_failed(self, message: str) -> None:
+        if self.update_progress_dialog is not None:
+            self.update_progress_dialog.close()
+            self.update_progress_dialog.deleteLater()
+            self.update_progress_dialog = None
+        QMessageBox.warning(self, "Update download failed", message or "The update could not be downloaded.")
+
+    def update_download_cancelled(self) -> None:
+        if self.update_progress_dialog is not None:
+            self.update_progress_dialog.close()
+            self.update_progress_dialog.deleteLater()
+            self.update_progress_dialog = None
+        self.statusBar().showMessage("Update download cancelled.", 5000)
+
+    def cleanup_update_download_worker(self, worker: UpdateDownloadWorker) -> None:
+        if self.update_download_worker is worker:
+            self.update_download_worker = None
+        worker.deleteLater()
+
     def open_about(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("About V Game Launcher")
@@ -2592,9 +3043,9 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(details)
         buttons_row = QHBoxLayout()
         github = QPushButton("Open GitHub")
-        github.clicked.connect(lambda: os.startfile("https://github.com/vladimirrankovicqa"))
+        github.clicked.connect(lambda: os.startfile(GITHUB_REPOSITORY_URL))
         updates = QPushButton("Check for Updates")
-        updates.clicked.connect(lambda: os.startfile("https://github.com/vladimirrankovicqa?tab=repositories"))
+        updates.clicked.connect(lambda: self.check_for_updates(interactive=True))
         buttons_row.addWidget(github)
         buttons_row.addWidget(updates)
         buttons_row.addStretch(1)
@@ -2632,6 +3083,12 @@ class LauncherWindow(QMainWindow):
         if self.cover_worker is not None and self.cover_worker.isRunning():
             self.cover_worker.requestInterruption()
             self.cover_worker.wait(2500)
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            self.update_check_worker.requestInterruption()
+            self.update_check_worker.wait((UPDATE_CHECK_TIMEOUT + 2) * 1000)
+        if self.update_download_worker is not None and self.update_download_worker.isRunning():
+            self.update_download_worker.requestInterruption()
+            self.update_download_worker.wait(3000)
         event.accept()
 
 
