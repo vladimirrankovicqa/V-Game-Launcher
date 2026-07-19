@@ -55,13 +55,13 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "V Game Launcher"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 GITHUB_REPOSITORY_URL = "https://github.com/vladimirrankovicqa/V-Game-Launcher"
 GITHUB_RELEASES_URL = f"{GITHUB_REPOSITORY_URL}/releases"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/vladimirrankovicqa/V-Game-Launcher/releases/latest"
 GITHUB_API_VERSION = "2026-03-10"
-PREFERRED_UPDATE_ASSET_NAMES = ("V.Game.Launcher.exe", "V Game Launcher.exe")
+PREFERRED_UPDATE_ASSET_NAMES = ("V_Game_Launcher.exe", "V-Game-Launcher.exe", "V.Game.Launcher.exe", "V Game Launcher.exe")
 UPDATE_CHECK_TIMEOUT = 10
 UPDATE_DOWNLOAD_TIMEOUT = 45
 MAX_UPDATE_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -1354,7 +1354,7 @@ class UpdateDownloadWorker(QThread):
             return
 
         safe_version = re.sub(r"[^0-9A-Za-z._-]+", "_", self.version.strip()) or "latest"
-        destination = UPDATE_DIR / f"V.Game.Launcher-{safe_version}.exe"
+        destination = UPDATE_DIR / f"V_Game_Launcher-{safe_version}.exe"
         partial = destination.with_suffix(destination.suffix + ".part")
         digest_value = str(self.asset.get("digest", "")).strip().casefold()
         expected_sha256 = digest_value.removeprefix("sha256:") if digest_value.startswith("sha256:") else ""
