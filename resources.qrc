@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>vgame_icon.png</file>
+    </qresource>
+</RCC>
