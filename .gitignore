@@ -1,24 +1,39 @@
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
-*.pyo
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
 
 # PyInstaller
 build/
 dist/
 *.spec
+build_*/
+dist_*/
+release_*/
+test_*/
 
-# Virtual environments
-venv/
-.venv/
+# Local fake/test source files
+v_game_launcher_fake_*.py
 
-# IDE
+# Local application data
+games.json
+launcher_settings.json
+assets/
+updates/
+*.old
+*.part
+
+# IDE and OS files
 .vscode/
 .idea/
-
-# Windows
 Thumbs.db
 Desktop.ini
+.DS_Store
 
 # Logs
 *.log
