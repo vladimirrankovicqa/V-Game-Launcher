@@ -1,72 +1,60 @@
 # V Game Launcher
 
-V Game Launcher is a Windows desktop application for managing and launching games from one place.
+A modern Windows desktop game launcher built with Python and PySide6.
+
+V Game Launcher lets you manage and launch games from one place, including local games and supported launcher-based libraries such as Steam, Epic Games, EA App / Origin, and GOG.
+
+![V Game Launcher Library](images/hero-library.png)
+
+---
 
 ## Features
 
-- Import installed Steam and Epic Games titles
-- Detect selected GOG and EA App games
-- Add local games and custom launch targets manually
-- Download and manage game cover images
-- Favorites and library filtering
-- Steam account and online/offline launch options
+- Import installed Steam games
+- Import installed Epic Games titles
+- Detect supported EA App / Origin games
+- Detect supported GOG games
+- Add local games manually
+- Download and manage cover images
+- Favorites support
+- Recently Played section
+- Search and sorting options
+- Dark and Light theme support
 - Automatic check for newer versions
-- Direct link to the latest GitHub Release
-- Local settings and library data stored in the user's AppData folder
+- Direct link to GitHub Releases for updates
 
-## Current Version
+---
 
-**2.0.0**
+## Screenshots
 
-## Requirements
+### Library
 
-- Windows 10 or Windows 11
-- Python 3.13 recommended for building from source
-- Dependencies listed in `requirements.txt`
+![Library](images/hero-library.png)
 
-## Run From Source
+### Import Installed Games
+
+![Import Games](images/import-games.png)
+
+### Preferences
+
+![Preferences](images/preferences.png)
+
+### About
+
+![About](images/about.png)
+
+---
+
+## Download
+
+Download the latest Windows executable from the repository's **Releases** section:
+
+[Latest Release](https://github.com/vladimirrankovicqa/V-Game-Launcher/releases/latest)
+
+---
+
+## Running From Source
 
 ```powershell
 python -m pip install -r requirements.txt
 python v_game_launcher.py
-```
-
-## Build the Windows EXE
-
-```powershell
-python -m PyInstaller --noconfirm --clean --windowed --onefile `
---name "V_Game_Launcher" `
---icon "v_game_launcher.ico" `
-"v_game_launcher.py"
-```
-
-The executable will be created at:
-
-```text
-dist\V_Game_Launcher.exe
-```
-
-## Updates
-
-The application checks GitHub for newer published versions. When an update is available, the popup shows the current and latest version and provides a button to open the official GitHub Releases page.
-
-Updates are downloaded and installed manually.
-
-## Project Files
-
-```text
-v_game_launcher.py
-resources_rc.py
-v_game_launcher.ico
-requirements.txt
-README.md
-.gitignore
-```
-
-## Download
-
-Download the latest Windows executable from the repository's **Releases** section.
-
-## License
-
-No license has been added yet. All rights are reserved unless a license file is added later.
